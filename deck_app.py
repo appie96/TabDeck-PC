@@ -442,6 +442,31 @@ def group_item_name(item):
     return os.path.basename(item.rstrip("\\/")) or item
 
 
+def action_summary(b):
+    """앱에 보낼 '누르면 할 일' 요약: {kind, gap, steps:[{type, text, sub}]}  (type: run/url/key/wait)"""
+    t = b.get("type", "run")
+
+    def step(item, kind=None):
+        low = item.lower()
+        if kind == "key" or low.startswith("key:"):
+            combo = item[4:] if low.startswith("key:") else item
+            return {"type": "key", "text": group_item_name("key:" + combo).replace("단축키 ", "", 1), "sub": "단축키 보내기"}
+        if low.startswith("wait:"):
+            return {"type": "wait", "text": group_item_name(item), "sub": ""}
+        if kind == "url" or re.match(r"(?i)https?://", item):
+            return {"type": "url", "text": item, "sub": "웹페이지 열기"}
+        return {"type": "run", "text": group_item_name(item), "sub": item if group_item_name(item) != item else "명령어 실행"}
+
+    if t == "group":
+        steps = [step(s.strip()) for s in b.get("group", []) if s and s.strip()]
+        return {"kind": dict(ACTION_TYPES)["group"], "gap": float(b.get("gap", 0.5) or 0), "steps": steps}
+    cmd = (b.get("cmd") or "").strip()
+    kind = dict(ACTION_TYPES).get(t, t)
+    if not cmd:
+        return {"kind": kind, "gap": 0, "steps": []}
+    return {"kind": kind, "gap": 0, "steps": [step(cmd, {"url": "url", "hotkey": "key"}.get(t))]}
+
+
 def run_action(b):
     t, cmd = b.get("type", "run"), b.get("cmd", "").strip()
     if t == "group":
@@ -663,6 +688,7 @@ class Store:
                         d["mode"], d["icon"] = "image", base64.b64encode(f.read()).decode()
                 elif b["glyph"] in GLYPHS:
                     d["mode"], d["icon"] = "glyph", image_to_b64(glyph_image(b["glyph"], tc, GLYPH_SIZE))
+                d["action"] = action_summary(b)          # 앱에서 꾹 누르면 보여 줄 '누르면 할 일'
                 items.append(d)
             self._payload = items
 
