@@ -68,7 +68,7 @@ UI_ICONS = {   # 화면용 아이콘 (버튼 아이콘 목록에는 안 나옴),
 
 
 # ───────────── 기본 설정 ─────────────
-VERSION = "0.1.2"        # exe 파일 정보에도 들어감 (build_exe.py가 읽음). 새로 배포할 때 올리고, GitHub 릴리스 태그도 v0.1.0처럼
+VERSION = "0.1.3"        # exe 파일 정보에도 들어감 (build_exe.py가 읽음). 새로 배포할 때 올리고, GitHub 릴리스 태그도 v0.1.0처럼
 UPDATE_REPO = "appie96/TabDeck-PC"   # 새 버전을 확인할 GitHub 저장소 "주인/이름". 비우면 확인 안 함
 UPDATE_API = os.environ.get("TABDECK_UPDATE_API", "https://api.github.com")   # 테스트할 땐 가짜 서버로 바꿀 수 있음
 UPDATE_EVERY = 24 * 3600 # 자동 확인 간격(초): 하루 한 번
