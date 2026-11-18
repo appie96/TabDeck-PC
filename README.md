@@ -1,7 +1,9 @@
 # TabDeck PC
 
 남는 안드로이드 폰·태블릿을 스트림 덱처럼 쓰게 해 주는 TabDeck의 **PC 프로그램**이야.
-같은 Wi-Fi의 TabDeck 앱이 버튼을 누르면, 이 프로그램이 PC에서 프로그램 실행·웹페이지 열기·단축키를 대신 실행해.
+같은 Wi-Fi의 TabDeck 앱이 버튼을 누르면, 이 프로그램이 PC에서 프로그램 실행·웹페이지 열기·단축키·여러 개 한꺼번에 실행을 대신 해.
+
+단축키는 실제 키보드와 같은 방식(SendInput, 가상 키 + 스캔 코드)으로 보내서 OBS·게임도 알아들어. 받는 프로그램이 관리자 권한으로 켜져 있으면 TabDeck도 관리자 권한으로 실행해 줘.
 
 ## 쓰는 법
 1. [Releases](../../releases/latest)에서 `TabDeck.exe`를 받아서 실행해.
@@ -12,7 +14,7 @@
 
 ## 직접 실행·빌드
 ```
-pip install PySide6-Essentials websockets pynput
+pip install PySide6-Essentials websockets
 python deck_app.py
 ```
 exe 만들기:

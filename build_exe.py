@@ -72,9 +72,6 @@ args = [
     "--distpath", os.path.join(HERE, "dist"),
     "--workpath", os.path.join(HERE, "build", "work"),
     "--specpath", os.path.join(HERE, "build"),
-    # 단축키 기능(pynput)은 윈도우용 부분을 실행 중에 골라 불러서, 미리 알려 줘야 같이 묶임
-    "--hidden-import", "pynput.keyboard._win32",
-    "--hidden-import", "pynput.mouse._win32",
     "--exclude-module", "tkinter",
 ]
 for name in ("Pretendard-Regular.otf", "Pretendard-Bold.otf", "Pretendard-LICENSE.txt"):

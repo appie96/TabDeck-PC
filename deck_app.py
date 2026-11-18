@@ -1,5 +1,5 @@
 # deck_app.py — TabDeck PC 프로그램 (설정 창 + 트레이 아이콘 + 서버)
-# 실행 전 한 번만: pip install PySide6-Essentials websockets pynput
+# 실행 전 한 번만: pip install PySide6-Essentials websockets
 import asyncio, base64, hashlib, hmac, json, math, os, re, secrets, shutil, socket, struct, subprocess, sys, tempfile, threading, time, uuid, wave, webbrowser
 import urllib.error, urllib.request
 
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QLabel, QLineEdit, QPushButton, QToolButton, QComboBox, QButtonGroup,
     QKeySequenceEdit, QStackedWidget, QGridLayout, QHBoxLayout, QVBoxLayout, QFrame, QFileDialog,
     QColorDialog, QMessageBox, QSystemTrayIcon, QMenu, QScrollArea, QDialog, QSlider, QLayout, QSizePolicy,
+    QListWidget, QDoubleSpinBox,
 )
 
 # ───────────── 내장 아이콘 ─────────────
@@ -105,7 +106,8 @@ DANGER = "#e46f78"
 SWATCHES = ["#ffffff", "#e2f3ef", "#a9dccf", "#cfe3f5", "#f6e7c9", "#f8dadb", "#e5dff6", "#3d6b62", "#1f2a44"]
 DEFAULT_COLOR = "#ffffff"
 
-ACTION_TYPES = [("run", "프로그램·파일 실행"), ("url", "웹페이지 열기"), ("hotkey", "단축키 보내기")]
+ACTION_TYPES = [("run", "프로그램·파일 실행"), ("url", "웹페이지 열기"), ("hotkey", "단축키 보내기"),
+                ("group", "여러 개 한꺼번에 실행")]
 
 
 def text_color_for(bg):
@@ -207,42 +209,192 @@ class Sound:
 
 
 # ───────────── 버튼 동작 실행 ─────────────
+# 단축키: 윈도우 SendInput으로 '진짜 키보드 키'(가상 키 번호 + 스캔 코드)를 보냄.
+#  예전 방식(pynput)은 글자 키를 '문자 입력'으로 보내서 OBS·Warudo·게임이 단축키로 못 알아들었음
+_VK_MODS = {"ctrl": 0x11, "shift": 0x10, "alt": 0x12, "meta": 0x5B, "win": 0x5B}
+_VK_NAMES = {
+    "esc": 0x1B, "escape": 0x1B, "return": 0x0D, "enter": 0x0D, "space": 0x20, "tab": 0x09,
+    "backspace": 0x08, "ins": 0x2D, "insert": 0x2D, "del": 0x2E, "delete": 0x2E,
+    "home": 0x24, "end": 0x23, "pgup": 0x21, "pgdown": 0x22, "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+    "print": 0x2C, "pause": 0x13, "scrolllock": 0x91, "capslock": 0x14, "numlock": 0x90, "menu": 0x5D,
+    "media play": 0xB3, "media pause": 0xB3, "toggle media play/pause": 0xB3, "media next": 0xB0,
+    "media previous": 0xB1, "media stop": 0xB2, "volume up": 0xAF, "volume down": 0xAE, "volume mute": 0xAD,
+}
+_VK_NUMPAD = {"*": 0x6A, "+": 0x6B, "-": 0x6D, ".": 0x6E, "/": 0x6F, "enter": 0x0D}
+# 확장 키: 스캔 코드에 '확장' 표시가 있어야 숫자 패드 키와 헷갈리지 않음
+_VK_EXTENDED = {0x2D, 0x2E, 0x24, 0x23, 0x21, 0x22, 0x25, 0x26, 0x27, 0x28, 0x2C, 0x90, 0x5D, 0x5B, 0x6F}
+
+
+def parse_hotkey(combo, vk_for_char=None):
+    """'ctrl+shift+f1' / 'ctrl+num+5' / 'media play' → (보조 키 번호 목록, 키 번호, 확장 키 여부)"""
+    s = (combo or "").strip().lower()
+    if not s:
+        raise ValueError("단축키가 비어 있어")
+    if s.endswith("+") and len(s) > 1:            # 마지막 키가 '+' 자체인 경우 (ctrl++)
+        tokens = [t.strip() for t in s[:-1].rstrip("+").split("+") if t.strip()] + ["+"]
+    else:
+        tokens = [t.strip() for t in s.split("+")]
+    *mods, key = tokens
+    numpad = "num" in mods
+    vks = []
+    for m in mods:
+        if m == "num":
+            continue
+        if m not in _VK_MODS:
+            raise ValueError(f"모르는 보조 키: {m}")
+        if _VK_MODS[m] not in vks:
+            vks.append(_VK_MODS[m])
+    ext = False
+    if numpad and (key.isdigit() and len(key) == 1):
+        vk = 0x60 + int(key)
+    elif numpad and key in _VK_NUMPAD:
+        vk = _VK_NUMPAD[key]
+        ext = key in ("enter", "/")
+    elif key in _VK_NAMES:
+        vk = _VK_NAMES[key]
+    elif re.fullmatch(r"f([1-9]|1\d|2[0-4])", key):
+        vk = 0x70 + int(key[1:]) - 1
+    elif len(key) == 1 and ("a" <= key <= "z" or "0" <= key <= "9"):
+        vk = ord(key.upper())
+    elif len(key) == 1 and vk_for_char:
+        code = vk_for_char(key)                   # 현재 키보드 배열에서 이 문자가 어느 키인지 (+Shift 필요 여부)
+        if code is None:
+            raise ValueError(f"이 키보드에서 찾을 수 없는 키: {key}")
+        vk, need_shift = code
+        if need_shift and 0x10 not in vks:        # Qt가 Shift+1을 'shift+!'로 적는 경우 등
+            vks.append(0x10)
+    else:
+        raise ValueError(f"모르는 키: {key}")
+    return vks, vk, ext or vk in _VK_EXTENDED
+
+
+def _win_vk_for_char(ch):
+    import ctypes
+    r = ctypes.windll.user32.VkKeyScanW(ord(ch))
+    if r == -1 or (r & 0xFF) == 0xFF:
+        return None
+    return r & 0xFF, bool(r & 0x100)
+
+
+def _foreground_is_admin_only():
+    """앞에 있는 창이 관리자 권한으로 실행 중이고 TabDeck은 아니면 True (윈도우가 키 입력을 몰래 막음)"""
+    import ctypes
+    from ctypes import wintypes
+    try:
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            return False
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        pid = wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value or pid.value == os.getpid():
+            return False
+        k32, adv = ctypes.windll.kernel32, ctypes.windll.advapi32
+        hp = k32.OpenProcess(0x1000, False, pid.value)          # PROCESS_QUERY_LIMITED_INFORMATION
+        if not hp:
+            return False
+        tok = wintypes.HANDLE()
+        try:
+            if not adv.OpenProcessToken(hp, 0x0008, ctypes.byref(tok)):   # TOKEN_QUERY
+                return True                                       # 토큰을 못 열면 관리자 프로그램일 가능성이 큼
+            elev, size = wintypes.DWORD(), wintypes.DWORD()
+            adv.GetTokenInformation(tok, 20, ctypes.byref(elev), 4, ctypes.byref(size))   # TokenElevation
+            k32.CloseHandle(tok)
+            return bool(elev.value)
+        finally:
+            k32.CloseHandle(hp)
+    except Exception:
+        return False
+
+
+def _win_send(vks, vk, ext, hold=0.06):
+    import ctypes
+    from ctypes import wintypes
+    ULONG_PTR = ctypes.c_size_t
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
+
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
+
+    class _U(ctypes.Union):
+        _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+    user32 = ctypes.windll.user32
+    user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+    user32.MapVirtualKeyW.restype = wintypes.UINT
+
+    def one(code, up, extended):
+        flags = (0x0001 if extended else 0) | (0x0002 if up else 0)      # EXTENDEDKEY, KEYUP
+        inp = INPUT(type=1)
+        inp.u.ki = KEYBDINPUT(code, user32.MapVirtualKeyW(code, 0) & 0xFF, flags, 0, 0)
+        if user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) != 1:
+            raise OSError("윈도우가 키 입력을 막았어")
+
+    pressed = []
+    try:
+        for m in vks:                               # 보조 키부터 차례로 누름
+            one(m, False, m == 0x5B)
+            pressed.append((m, m == 0x5B))
+            time.sleep(0.015)
+        one(vk, False, ext)
+        pressed.append((vk, ext))
+        time.sleep(hold)                            # 잠깐 누르고 있어야 OBS처럼 키 상태를 살피는 프로그램도 알아챔
+    finally:
+        for code, extended in reversed(pressed):   # 중간에 실패해도 눌린 키는 꼭 뗌
+            one(code, True, extended)
+            time.sleep(0.015)
+
+
 def send_hotkey(combo):
-    """'ctrl+shift+f1' 같은 글자를 실제 키 입력으로 바꿔서 누름"""
-    from pynput.keyboard import Controller, Key, KeyCode
-    names = {
-        "ctrl": Key.ctrl, "shift": Key.shift, "alt": Key.alt, "meta": Key.cmd, "win": Key.cmd,
-        "esc": Key.esc, "return": Key.enter, "enter": Key.enter, "space": Key.space, "tab": Key.tab,
-        "backspace": Key.backspace, "del": Key.delete, "delete": Key.delete, "ins": Key.insert,
-        "home": Key.home, "end": Key.end, "pgup": Key.page_up, "pgdown": Key.page_down,
-        "left": Key.left, "right": Key.right, "up": Key.up, "down": Key.down,
-    }
-    keys = []
-    for part in combo.lower().replace(" ", "").split("+"):
-        if part in names:
-            keys.append(names[part])
-        elif hasattr(Key, part):            # f1 ~ f20
-            keys.append(getattr(Key, part))
-        elif len(part) == 1:
-            keys.append(KeyCode.from_char(part))
-        else:
-            raise ValueError(f"모르는 키: {part}")
-    kb = Controller()
-    for k in keys:
-        kb.press(k)
-    for k in reversed(keys):
-        kb.release(k)
+    """'ctrl+shift+f1' 같은 글자를 실제 키보드 입력으로 바꿔서 누름"""
+    if sys.platform != "win32":
+        raise ValueError("단축키 보내기는 윈도우에서만 돼")
+    vks, vk, ext = parse_hotkey(combo, _win_vk_for_char)
+    if _foreground_is_admin_only():
+        raise ValueError("지금 앞에 있는 창이 관리자 권한으로 실행 중이라 윈도우가 단축키를 막아. "
+                         "TabDeck도 관리자 권한으로 실행하거나, 그 프로그램을 일반 권한으로 실행해 줘")
+    _win_send(vks, vk, ext)
+
+
+def open_target(target):
+    """프로그램·파일 경로, 웹 주소, 명령어를 알맞은 방법으로 열기"""
+    target = target.strip()
+    if re.match(r"(?i)https?://", target):
+        webbrowser.open(target)
+    elif hasattr(os, "startfile") and os.path.exists(target):
+        os.startfile(target)                        # 파일·프로그램 경로면 윈도우 방식으로 열기
+    else:
+        subprocess.Popen(target, shell=True)        # 그 외에는 명령어로 실행
 
 
 def run_action(b):
     t, cmd = b.get("type", "run"), b.get("cmd", "").strip()
+    if t == "group":
+        items = [s.strip() for s in b.get("group", []) if s and s.strip()]
+        if not items:
+            raise ValueError("그룹에 실행할 게 없어")
+        gap = min(max(float(b.get("gap", 0.5) or 0), 0.0), 10.0)
+        fails = []
+        for i, item in enumerate(items):
+            if i and gap:
+                time.sleep(gap)                     # 프로그램끼리 부딪히지 않게 조금씩 간격
+            try:
+                open_target(item)
+            except Exception as e:
+                fails.append(f"{os.path.basename(item) or item} ({e})")
+        if fails:
+            raise ValueError(f"{len(items)}개 중 {len(fails)}개 실패: " + ", ".join(fails))
+        return
     if not cmd:
         raise ValueError("실행할 내용이 비어 있어")
     if t == "run":
-        if hasattr(os, "startfile") and os.path.exists(cmd):
-            os.startfile(cmd)                       # 파일·프로그램 경로면 윈도우 방식으로 열기
-        else:
-            subprocess.Popen(cmd, shell=True)       # 그 외에는 명령어로 실행
+        open_target(cmd)
     elif t == "url":
         webbrowser.open(cmd)
     elif t == "hotkey":
@@ -287,6 +439,7 @@ class Store:
         data["settings"].setdefault("update_check", True)   # 새 버전 알림 (하루 한 번 버전 번호만 물어봄)
         for b in data["buttons"]:                        # 예전 설정 파일도 그대로 읽히게
             b.setdefault("type", "run"); b.setdefault("cmd", "")
+            b.setdefault("group", []); b.setdefault("gap", 0.5)   # 그룹 실행: 열 것 목록, 사이 간격(초)
             b.setdefault("color", DEFAULT_COLOR); b.setdefault("icon", ""); b.setdefault("glyph", "")
             b.setdefault("src", ""); b.setdefault("crop", None)   # 원본 파일 이름, 마지막 자르기 위치
             if b["color"].lower() == "#2a2b36":         # 예전 버전의 어두운 기본색은 새 기본색으로
@@ -654,6 +807,10 @@ QLabel#section {{ color:{SUB}; font-size:12px; font-weight:bold; }}
 QLabel#hint {{ color:{SUB}; font-size:12px; }}
 QLabel#log {{ color:{SUB}; font-size:12px; }}
 QLabel#pill {{ background:{BG}; border-radius:14px; padding:7px 12px; }}
+QListWidget#group {{ background:{CARD}; border:1px solid {LINE}; border-radius:12px; padding:4px; outline:none; }}
+QListWidget#group::item {{ padding:6px 8px; border-radius:8px; color:{INK}; }}
+QListWidget#group::item:selected {{ background:{MINT_L}; color:{INK}; }}
+QDoubleSpinBox {{ background:{CARD}; border:1px solid {LINE}; border-radius:10px; padding:5px 8px; }}
 QLineEdit, QComboBox, QKeySequenceEdit {{ background:{CARD}; border:1px solid {LINE}; border-radius:12px; padding:8px 11px; }}
 QLineEdit:focus, QComboBox:focus {{ border:1px solid {MINT}; }}
 QComboBox::drop-down {{ border:none; width:26px; }}
@@ -1325,6 +1482,8 @@ class CropDialog(QDialog):
 
 # ───────────── 메인 창 ─────────────
 class MainWindow(QMainWindow):
+    test_finished = Signal(bool, str)     # 'PC에서 테스트' 결과 (실행은 다른 스레드에서)
+
     def __init__(self, store, server, bridge):
         super().__init__()
         self.store, self.server = store, server
@@ -1366,6 +1525,7 @@ class MainWindow(QMainWindow):
         self.refresh_grid()
         self.select(self.store.buttons[0]["id"] if self.store.buttons else None)
         self._apply_look()                 # 저장된 유리 효과·배경 움직임 설정 적용
+        self.test_finished.connect(self._on_test_finished)
         # 새 버전 확인 (켜고 5초 뒤, 하루 한 번)
         self.latest, self.about = None, None
         self.updater = Updater(self)
@@ -1841,8 +2001,50 @@ class MainWindow(QMainWindow):
             self.key_edit.setMaximumSequenceLength(1)
         self.key_edit.keySequenceChanged.connect(self._on_key)
         r1.addWidget(self.key_edit)
+        # 그룹: 열 것 목록 (프로그램·파일·웹 주소), 순서 바꾸기, 사이 간격
+        p2 = QWidget(objectName="page")
+        g2 = QVBoxLayout(p2)
+        g2.setContentsMargins(0, 0, 0, 0)
+        g2.setSpacing(6)
+        self.group_list = QListWidget(objectName="group")
+        self.group_list.setMinimumHeight(118)
+        self.group_list.setTextElideMode(Qt.ElideMiddle)
+        self.group_list.currentRowChanged.connect(lambda _: self._update_group_buttons())
+        g2.addWidget(self.group_list)
+        add_row = QHBoxLayout()
+        self.group_input = QLineEdit()
+        self.group_input.setPlaceholderText("경로나 https:// 주소를 넣고 Enter")
+        self.group_input.returnPressed.connect(self._group_add_text)
+        add_row.addWidget(self.group_input, 1)
+        g_browse = QPushButton("찾아보기")
+        g_browse.clicked.connect(self._group_browse)
+        add_row.addWidget(g_browse)
+        g2.addLayout(add_row)
+        btn_box = QWidget()
+        bl = FlowLayout(btn_box, spacing=6)
+        self.group_up = QPushButton("↑ 위로", objectName="ghost")
+        self.group_up.clicked.connect(lambda: self._group_move(-1))
+        self.group_down = QPushButton("↓ 아래로", objectName="ghost")
+        self.group_down.clicked.connect(lambda: self._group_move(1))
+        self.group_del = QPushButton("빼기", objectName="ghost")
+        self.group_del.clicked.connect(self._group_remove)
+        for w in (self.group_up, self.group_down, self.group_del):
+            bl.addWidget(w)
+        g2.addWidget(btn_box)
+        gap_row = QHBoxLayout()
+        gap_row.addWidget(QLabel("하나 열고 다음까지", objectName="hint"))
+        self.gap_spin = QDoubleSpinBox()
+        self.gap_spin.setRange(0, 10)
+        self.gap_spin.setSingleStep(0.5)
+        self.gap_spin.setDecimals(1)
+        self.gap_spin.setSuffix(" 초")
+        self.gap_spin.valueChanged.connect(lambda v: self._set("gap", float(v), refresh_tile=False))
+        gap_row.addWidget(self.gap_spin)
+        gap_row.addStretch()
+        g2.addLayout(gap_row)
         self.target_stack.addWidget(p0)
         self.target_stack.addWidget(p1)
+        self.target_stack.addWidget(p2)
         lay.addWidget(self.target_stack)
         self.target_hint = QLabel(objectName="hint")
         self.target_hint.setWordWrap(True)
@@ -1901,8 +2103,7 @@ class MainWindow(QMainWindow):
         else:
             self.name_edit.setText(b["label"])
             self.hero_tile.set_button(b, self.store)
-            kind = dict(ACTION_TYPES)[b["type"]]
-            self.hero_sub.setText(f"{kind} · {b['cmd']}" if b["cmd"] else kind)
+            self._refresh_hero_sub()
             self.segs[self.icon_view].setChecked(True)
             self.glyph_box.setVisible(self.icon_view == "glyph")
             self.image_box.setVisible(self.icon_view == "image")
@@ -1929,16 +2130,25 @@ class MainWindow(QMainWindow):
             self.type_combo.setCurrentIndex([k for k, _ in ACTION_TYPES].index(b["type"]))
             self.cmd_edit.setText(b["cmd"] if b["type"] != "hotkey" else "")
             self.key_edit.setKeySequence(QKeySequence(b["cmd"]) if b["type"] == "hotkey" else QKeySequence())
+            self._fill_group(b)
             self._update_target_ui(b["type"])
         self.loading = False
 
     def _update_target_ui(self, t):
-        self.target_stack.setCurrentIndex(1 if t == "hotkey" else 0)
+        cur = {"hotkey": 1, "group": 2}.get(t, 0)
+        self.target_stack.setCurrentIndex(cur)
+        for i in range(self.target_stack.count()):     # 보이는 칸 높이만 차지하게 (그룹 칸 때문에 빈자리 안 생기게)
+            self.target_stack.widget(i).setSizePolicy(
+                QSizePolicy.Preferred, QSizePolicy.Preferred if i == cur else QSizePolicy.Ignored)
+        self.target_stack.adjustSize()
         self.browse_btn.setVisible(t == "run")
         hints = {
             "run": "프로그램(.exe)이나 파일, 바로가기를 고르면 돼. 명령어를 직접 써도 돼.",
             "url": "예: https://www.youtube.com",
-            "hotkey": "칸을 클릭하고 보낼 단축키를 그대로 눌러. OBS 단축키랑 맞추면 장면 전환에 쓸 수 있어.",
+            "hotkey": "칸을 클릭하고 보낼 단축키를 그대로 눌러. OBS 단축키랑 맞추면 장면 전환에 쓸 수 있어. "
+                      "받는 프로그램이 관리자 권한으로 켜져 있으면 TabDeck도 관리자 권한으로 켜야 해.",
+            "group": "버튼 하나로 위에서부터 차례로 열어. 프로그램·파일·바로가기와 https:// 주소를 섞어도 돼. "
+                     "한 번에 여러 개 고를 수도 있어.",
         }
         self.cmd_edit.setPlaceholderText("https://..." if t == "url" else "C:\\...\\program.exe")
         self.target_hint.setText(hints[t])
@@ -2041,6 +2251,73 @@ class MainWindow(QMainWindow):
         self._set("cmd", "", refresh_tile=False)
         self._load_editor()
 
+    # ── 그룹 목록 편집 ──
+    def _fill_group(self, b):
+        self.group_list.clear()
+        for item in b.get("group", []):
+            self.group_list.addItem(self._group_label(item))
+            self.group_list.item(self.group_list.count() - 1).setToolTip(item)
+        self.gap_spin.setValue(float(b.get("gap", 0.5) or 0))
+        self._update_group_buttons()
+
+    @staticmethod
+    def _group_label(item):
+        if re.match(r"(?i)https?://", item):
+            return "🌐  " + item
+        return "▶  " + (os.path.basename(item.rstrip("\\/")) or item)
+
+    def _group_items(self):
+        return list(self.store.get(self.selected).get("group", [])) if self.selected else []
+
+    def _group_save(self, items, row=None):
+        self._set("group", items, refresh_tile=False)
+        self._fill_group(self.store.get(self.selected))
+        if row is not None and 0 <= row < self.group_list.count():
+            self.group_list.setCurrentRow(row)
+        self._refresh_hero_sub()
+
+    def _update_group_buttons(self):
+        row, n = self.group_list.currentRow(), self.group_list.count()
+        self.group_up.setEnabled(row > 0)
+        self.group_down.setEnabled(0 <= row < n - 1)
+        self.group_del.setEnabled(row >= 0)
+
+    def _group_add_text(self):
+        text = self.group_input.text().strip().strip('"')
+        if text:
+            items = self._group_items() + [text]
+            self.group_input.clear()
+            self._group_save(items, len(items) - 1)
+
+    def _group_browse(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "그룹에 넣을 프로그램·파일 고르기 (여러 개 가능)", "", "모든 파일 (*.*)")
+        if paths:
+            items = self._group_items() + [os.path.normpath(p) for p in paths]
+            self._group_save(items, len(items) - 1)
+
+    def _group_move(self, d):
+        row, items = self.group_list.currentRow(), self._group_items()
+        if 0 <= row < len(items) and 0 <= row + d < len(items):
+            items[row], items[row + d] = items[row + d], items[row]
+            self._group_save(items, row + d)
+
+    def _group_remove(self):
+        row, items = self.group_list.currentRow(), self._group_items()
+        if 0 <= row < len(items):
+            del items[row]
+            self._group_save(items, min(row, len(items) - 1))
+
+    def _refresh_hero_sub(self):
+        b = self.store.get(self.selected) if self.selected else None
+        if not b:
+            return
+        kind = dict(ACTION_TYPES)[b["type"]]
+        if b["type"] == "group":
+            n = len(b.get("group", []))
+            self.hero_sub.setText(f"{kind} · {n}개" if n else kind)
+        else:
+            self.hero_sub.setText(f"{kind} · {b['cmd']}" if b["cmd"] else kind)
+
     def _on_key(self, seq):
         if self.loading:
             return
@@ -2108,11 +2385,16 @@ class MainWindow(QMainWindow):
             delay = 420
 
         def go():
-            try:
-                run_action(b)
-                ok, msg = True, f"테스트 실행 · {b['label']}"
-            except Exception as e:
-                ok, msg = False, f"실패 · {e}"
+            # 실행은 따로 돌림: 그룹 실행은 간격만큼 기다리니까 창이 멈추지 않게
+            def work():
+                try:
+                    run_action(dict(b))
+                    self.test_finished.emit(True, f"테스트 실행 · {b['label']}")
+                except Exception as e:
+                    self.test_finished.emit(False, f"실패 · {e}")
+            threading.Thread(target=work, daemon=True).start()
+
+        def finish(ok, msg):
             self.log_label.setText(msg)
             if tile:
                 tile.play_result(ok)
@@ -2124,7 +2406,14 @@ class MainWindow(QMainWindow):
             self.testing = False
             self._set_test_state("", "PC에서 테스트")
 
+        self._test_cb = finish
         QTimer.singleShot(delay, go)
+
+    def _on_test_finished(self, ok, msg):
+        # 창의 메서드로 받아야 다른 스레드에서 보낸 결과가 화면 스레드에서 처리됨
+        cb, self._test_cb = getattr(self, "_test_cb", None), None
+        if cb:
+            cb(ok, msg)
 
     # ── 트레이 아이콘 ──
     def _build_tray(self):
