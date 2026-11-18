@@ -6,7 +6,8 @@ import urllib.error, urllib.request
 import websockets
 from PySide6.QtCore import Qt, QObject, QTranslator, Signal, QTimer, QSize, QPoint, QPointF, QRect, QRectF, QEvent, QByteArray, QBuffer, QIODevice, QVariantAnimation, QEasingCurve
 from PySide6.QtGui import (QIcon, QPixmap, QPainter, QPainterPath, QPen, QColor, QFont, QImage, QImageReader,
-                           QKeySequence, QAction, QActionGroup, QFontDatabase, QGuiApplication, QLinearGradient, QRadialGradient)
+                           QKeySequence, QAction, QActionGroup, QFontDatabase, QGuiApplication, QLinearGradient, QRadialGradient,
+                           QFontMetricsF, QTextLayout, QTextOption)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
@@ -362,15 +363,62 @@ def send_hotkey(combo):
     _win_send(vks, vk, ext)
 
 
+_ENV_LOCK = threading.Lock()
+_OUR_ENV_KEYS = ("QT_PLUGIN_PATH", "QML2_IMPORT_PATH")   # exe로 묶을 때 PyInstaller가 TabDeck용으로 넣는 값
+
+
+def child_env(base=None):
+    """다른 프로그램에 물려줄 환경 변수: TabDeck(exe)이 자기용으로 바꾼 값은 빼고 원래대로.
+    안 빼면 Qt로 만든 프로그램이 TabDeck의 Qt 부품을 잘못 불러와서 설정·프리셋이 안 읽히는 등 오작동할 수 있음"""
+    env = dict(os.environ if base is None else base)
+    mei = getattr(sys, "_MEIPASS", None)
+    if not mei:
+        return env
+    for k in list(env):
+        if k.upper() in _OUR_ENV_KEYS or k.upper().startswith(("_PYI", "_MEI")):
+            env.pop(k)
+    mei_n = os.path.normcase(os.path.normpath(mei))
+    for k in list(env):
+        if k.upper() == "PATH":
+            env[k] = os.pathsep.join(p for p in env[k].split(os.pathsep)
+                                     if p and not os.path.normcase(os.path.normpath(p)).startswith(mei_n))
+    return env
+
+
+class _CleanEnv:
+    """윈도우 '열기'(ShellExecute)는 환경 변수를 따로 넘길 수 없어서, 여는 동안만 원래 값으로 잠깐 바꿔 둠"""
+    def __enter__(self):
+        _ENV_LOCK.acquire()
+        self.saved = dict(os.environ)
+        clean = child_env(self.saved)
+        if clean != self.saved:
+            os.environ.clear()
+            os.environ.update(clean)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            if dict(os.environ) != self.saved:
+                os.environ.clear()
+                os.environ.update(self.saved)
+        finally:
+            _ENV_LOCK.release()
+
+
 def open_target(target):
-    """프로그램·파일 경로, 웹 주소, 명령어를 알맞은 방법으로 열기"""
-    target = target.strip()
+    """프로그램·파일 경로, 웹 주소, 명령어를 알맞은 방법으로 열기 (탐색기에서 더블클릭한 것과 같게)"""
+    target = target.strip().strip('"')
     if re.match(r"(?i)https?://", target):
-        webbrowser.open(target)
+        with _CleanEnv():
+            webbrowser.open(target)
     elif hasattr(os, "startfile") and os.path.exists(target):
-        os.startfile(target)                        # 파일·프로그램 경로면 윈도우 방식으로 열기
+        # 시작 폴더를 그 프로그램이 있는 폴더로: 프리셋·설정을 자기 폴더 기준으로 찾는 프로그램이 많음
+        # (바로가기 .lnk는 바로가기에 적힌 '시작 위치'를 그대로 씀)
+        folder = os.path.dirname(os.path.abspath(target)) if os.path.isfile(target) else None
+        with _CleanEnv():
+            os.startfile(target, cwd=folder)
     else:
-        subprocess.Popen(target, shell=True)        # 그 외에는 명령어로 실행
+        subprocess.Popen(target, shell=True, env=child_env())   # 그 외에는 명령어로 실행
 
 
 class KoreanTexts(QTranslator):
@@ -1025,6 +1073,57 @@ class ElideLabel(QLabel):
         super().setText(self.fontMetrics().elidedText(self._full, Qt.ElideRight, max(10, self.width())))
 
 
+def fit_text(base_font, text, width, height, max_pt, min_pt, max_lines):
+    """긴 이름 맞추기: 줄바꿈(최대 max_lines줄) → 그래도 넘치면 글자 크기를 줄임 → 가장 작게도 안 되면 마지막 줄 끝을 …로.
+    돌려주는 값: (글꼴, 줄 목록, 줄 높이)"""
+    text = " ".join((text or "").split())
+    size = float(max_pt)
+    while True:
+        f = QFont(base_font)
+        f.setPointSizeF(size)
+        fm = QFontMetricsF(f)
+        layout = QTextLayout(text, f)
+        opt = QTextOption()
+        opt.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)   # 띄어쓰기에서 먼저, 안 되면 글자 사이에서
+        layout.setTextOption(opt)
+        layout.beginLayout()
+        lines = []
+        while True:
+            line = layout.createLine()
+            if not line.isValid():
+                break
+            line.setLineWidth(width)
+            lines.append(text[line.textStart():line.textStart() + line.textLength()].strip())
+        layout.endLayout()
+        lh = fm.lineSpacing()
+        fits = len(lines) <= max_lines and len(lines) * lh <= height + 0.5
+        if fits or size <= min_pt:
+            break
+        size = max(min_pt, size - 0.5)
+    if not fits:                                   # 가장 작은 글씨로도 넘침 → 들어가는 줄까지만, 끝은 …
+        keep = max(1, min(max_lines, int((height + 0.5) // lh)))
+        rest = " ".join(lines[keep - 1:])
+        lines = lines[:keep - 1] + [fm.elidedText(rest, Qt.ElideRight, width)]
+    return f, lines, lh
+
+
+def draw_fit_text(p, rect, text, max_pt, min_pt, max_lines, align):
+    """rect 안에 긴 이름을 맞춰 그림. align: 가로(왼쪽/가운데) | 세로(위/가운데/아래)"""
+    f, lines, lh = fit_text(p.font(), text, rect.width(), rect.height(), max_pt, min_pt, max_lines)
+    p.setFont(f)
+    total = lh * len(lines)
+    if align & Qt.AlignBottom:
+        y = rect.bottom() - total
+    elif align & Qt.AlignVCenter:
+        y = rect.top() + (rect.height() - total) / 2
+    else:
+        y = rect.top()
+    h = align & (Qt.AlignLeft | Qt.AlignHCenter | Qt.AlignRight)
+    for ln in lines:
+        p.drawText(QRectF(rect.left(), y, rect.width(), lh), h | Qt.AlignVCenter, ln)
+        y += lh
+
+
 class Tile(QWidget):
     """마우스를 올리면 떠오르고, 누르면 쑥 들어가며 민트빛이 퍼지는 버튼"""
     clicked = Signal()
@@ -1157,20 +1256,21 @@ class Tile(QWidget):
             g.setColorAt(0, QColor(15, 22, 38, 0))
             g.setColorAt(1, QColor(15, 22, 38, 170))
             p.fillRect(r, g)
+            # 긴 이름은 두 줄 → 글자 줄임 → … (앱 화면과 같은 규칙)
             p.setPen(QColor("white"))
             p.setFont(self._font(11, True))
-            p.drawText(r.adjusted(12, 0, -12, -10), Qt.AlignBottom | Qt.AlignLeft,
-                       p.fontMetrics().elidedText(b["label"], Qt.ElideRight, int(r.width() - 24)))
+            draw_fit_text(p, r.adjusted(12, r.height() * 0.45, -12, -9), b["label"], 11, 8, 2,
+                          Qt.AlignLeft | Qt.AlignBottom)
         elif self.glyph:
             p.drawImage(QRectF(c.x() - 22, r.top() + 20, 44, 44), self.glyph)
             p.setPen(tc)
             p.setFont(self._font(11, True))
-            p.drawText(QRectF(r.left() + 8, r.top() + 70, r.width() - 16, 22), Qt.AlignCenter,
-                       p.fontMetrics().elidedText(b["label"], Qt.ElideRight, int(r.width() - 16)))
+            draw_fit_text(p, QRectF(r.left() + 8, r.top() + 68, r.width() - 16, r.height() - 72), b["label"],
+                          11, 8, 2, Qt.AlignHCenter | Qt.AlignTop)
         else:
             p.setPen(tc)
             p.setFont(self._font(13, True))
-            p.drawText(r.adjusted(10, 10, -10, -10), Qt.AlignCenter | Qt.TextWordWrap, b["label"])
+            draw_fit_text(p, r.adjusted(10, 10, -10, -10), b["label"], 13, 8, 3, Qt.AlignHCenter | Qt.AlignVCenter)
 
         # 누른 자리에서 퍼지는 민트빛
         if 0 < self.ripple < 1:
@@ -1659,7 +1759,61 @@ class MainWindow(QMainWindow):
     def eventFilter(self, obj, e):
         if obj is getattr(self, "topbar", None) and e.type() == QEvent.Resize:
             QTimer.singleShot(0, self._fit_topbar)
+        # 탐색기에서 프로그램·파일을 끌어다 놓기
+        zone = getattr(self, "drop_zones", {}).get(obj)
+        if zone and e.type() in (QEvent.DragEnter, QEvent.DragMove, QEvent.Drop):
+            paths = self._dropped_paths(e.mimeData())
+            if not paths or (zone == "editor" and not self.selected):
+                return False                      # 파일이 아니면 원래 동작(글자 끌어 놓기 등) 그대로
+            e.setDropAction(Qt.CopyAction)
+            e.accept()
+            if e.type() == QEvent.Drop:
+                self._files_dropped(zone, paths)
+            return True
         return super().eventFilter(obj, e)
+
+    def _drop_zone(self, widget, zone):
+        if not hasattr(self, "drop_zones"):
+            self.drop_zones = {}
+        self.drop_zones[widget] = zone
+        widget.setAcceptDrops(True)
+        widget.installEventFilter(self)
+
+    @staticmethod
+    def _dropped_paths(mime):
+        if not mime.hasUrls():
+            return []
+        out = []
+        for u in mime.urls():
+            p = u.toLocalFile()
+            if p and os.path.isfile(p):               # 폴더·인터넷 주소는 빼고 실제 파일만
+                out.append(os.path.normpath(p))
+        return out
+
+    def _files_dropped(self, zone, paths):
+        if zone == "grid":
+            # 왼쪽 버튼 목록: 파일마다 새 버튼 (이름 = 파일 이름, 누르면 그 파일 실행)
+            last = None
+            for p in paths:
+                last = self.store.add()
+                self.store.update(last, label=os.path.splitext(os.path.basename(p))[0][:40], type="run", cmd=p)
+            self.refresh_grid()
+            self.select(last)
+            self.save_timer.start()
+            self.log_label.setText(f"버튼 {len(paths)}개를 만들었어 · 이름과 아이콘은 오른쪽에서 바꿔 줘")
+            return
+        b = self.store.get(self.selected)
+        if b["type"] == "group":
+            self._group_save(self._group_items() + paths, len(b.get("group", [])) + len(paths) - 1)
+        elif len(paths) > 1:
+            # 여러 개를 놓으면 '여러 개 한꺼번에 실행'으로
+            self.store.update(self.selected, type="group", group=paths, cmd="")
+            self._load_editor()
+        else:
+            self.store.update(self.selected, type="run", cmd=paths[0])
+            self._load_editor()
+        self._refresh_hero_sub()
+        self.save_timer.start()
 
     def _fit_topbar(self):
         bar = self.topbar
@@ -1846,6 +2000,7 @@ class MainWindow(QMainWindow):
         self.grid_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.grid_scroll.setWidget(holder)
         lay.addWidget(self.grid_scroll, 1)
+        self._drop_zone(self.grid_scroll.viewport(), "grid")
         self.columns = 4
         self.log_label = QLabel("아직 기록이 없어", objectName="log")
         self.log_label.setTextFormat(Qt.PlainText)    # 버튼 이름 등에 HTML이 섞여도 글자 그대로 표시
@@ -1893,6 +2048,7 @@ class MainWindow(QMainWindow):
         scroll.setWidget(inner)
         pl.addWidget(scroll)
         self.editor_scroll = scroll
+        self._drop_zone(scroll.viewport(), "editor")
         outer = lay
         outer.setSpacing(12)
 
@@ -2088,6 +2244,8 @@ class MainWindow(QMainWindow):
         self.target_stack.addWidget(p0)
         self.target_stack.addWidget(p1)
         self.target_stack.addWidget(p2)
+        for w in (self.cmd_edit, self.group_input, self.group_list.viewport(), self.key_edit):
+            self._drop_zone(w, "editor")
         lay.addWidget(self.target_stack)
         self.target_hint = QLabel(objectName="hint")
         self.target_hint.setWordWrap(True)
@@ -2186,7 +2344,7 @@ class MainWindow(QMainWindow):
         self.target_stack.adjustSize()
         self.browse_btn.setVisible(t == "run")
         hints = {
-            "run": "프로그램(.exe)이나 파일, 바로가기를 고르면 돼. 명령어를 직접 써도 돼.",
+            "run": "프로그램(.exe)이나 파일, 바로가기를 고르거나 탐색기에서 이 패널로 끌어다 놔도 돼. 명령어를 직접 써도 돼.",
             "url": "예: https://www.youtube.com",
             "hotkey": "칸을 클릭하고 보낼 단축키를 그대로 눌러. OBS 단축키랑 맞추면 장면 전환에 쓸 수 있어. "
                       "받는 프로그램이 관리자 권한으로 켜져 있으면 TabDeck도 관리자 권한으로 켜야 해.",
