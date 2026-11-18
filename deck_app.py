@@ -4,10 +4,10 @@ import asyncio, base64, hashlib, hmac, json, math, os, re, secrets, shutil, sock
 import urllib.error, urllib.request
 
 import websockets
-from PySide6.QtCore import Qt, QObject, QTranslator, Signal, QTimer, QSize, QPoint, QPointF, QRect, QRectF, QEvent, QByteArray, QBuffer, QIODevice, QVariantAnimation, QEasingCurve
+from PySide6.QtCore import Qt, QObject, QTranslator, QMimeData, Signal, QTimer, QSize, QPoint, QPointF, QRect, QRectF, QEvent, QByteArray, QBuffer, QIODevice, QVariantAnimation, QEasingCurve
 from PySide6.QtGui import (QIcon, QPixmap, QPainter, QPainterPath, QPen, QColor, QFont, QImage, QImageReader,
                            QKeySequence, QAction, QActionGroup, QFontDatabase, QGuiApplication, QLinearGradient, QRadialGradient,
-                           QFontMetricsF, QTextLayout, QTextOption)
+                           QFontMetricsF, QTextLayout, QTextOption, QDrag)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
@@ -98,6 +98,7 @@ MAX_SOURCE = 2400        # 자르기 창에서 다룰 원본의 최대 긴 변(p
 IMAGE_SIZE = 256         # 앱으로 보낼 버튼 이미지 크기(px)
 GLYPH_SIZE = 128         # 앱으로 보낼 아이콘 크기(px)
 TILE = 128               # 설정 창 미리보기 버튼 한 칸 크기(px)
+TILE_MIME = "application/x-tabdeck-button"   # 버튼 순서 바꾸기용 끌기 데이터
 
 # 색 (밝은 민트 테마)
 BG, CARD, LINE = "#eef4f2", "#ffffff", "#e2ebe8"
@@ -573,6 +574,16 @@ class Store:
     def remove(self, bid):
         with self.lock:
             self.data["buttons"] = [b for b in self.buttons if b["id"] != bid]
+
+    def move_to(self, bid, index):
+        """버튼을 index 자리로 옮김 (끌어서 순서 바꾸기)"""
+        with self.lock:
+            lst = self.buttons
+            i = next(i for i, b in enumerate(lst) if b["id"] == bid)
+            b = lst.pop(i)
+            if index > i:
+                index -= 1                 # 빼낸 만큼 뒤쪽 자리가 하나 당겨짐
+            lst.insert(max(0, min(len(lst), index)), b)
 
     def move(self, bid, step):
         with self.lock:
@@ -1137,6 +1148,8 @@ class Tile(QWidget):
         self.lift = self.press = self.ripple = self.badge = self.fail = 0.0
         self.ripple_pos = QPointF(64, 64)
         self._anims = {}
+        self._press_at = None          # 누른 자리 (끌기 시작 판단용)
+        self.dragging = False          # 끄는 중이면 제자리는 흐리게
 
     def set_button(self, b, store):
         self.b = b
@@ -1172,9 +1185,37 @@ class Tile(QWidget):
         if self.press:
             self._anim("press", 0, 220)
 
+    def mouseMoveEvent(self, e):
+        # 누른 채로 조금 움직이면 끌기 시작 (버튼 순서 바꾸기). '버튼 추가' 칸은 못 끎
+        if self.add or not self.b or not (e.buttons() & Qt.LeftButton) or self._press_at is None:
+            return
+        if (e.position() - self._press_at).manhattanLength() < QApplication.startDragDistance():
+            return
+        self._press_at = None
+        self._anim("press", 0, 160)
+        mime = QMimeData()
+        mime.setData(TILE_MIME, self.b["id"].encode())
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        pm = self.grab()
+        faded = QPixmap(pm.size())
+        faded.fill(Qt.transparent)
+        fp = QPainter(faded)
+        fp.setOpacity(0.85)
+        fp.drawPixmap(0, 0, pm)
+        fp.end()
+        drag.setPixmap(faded)
+        drag.setHotSpot(e.position().toPoint())
+        self.dragging = True
+        self.update()
+        drag.exec(Qt.MoveAction)
+        self.dragging = False
+        self.update()
+
     def mousePressEvent(self, e):
         if e.button() != Qt.LeftButton:
             return
+        self._press_at = e.position()
         self.ripple_pos = e.position()
         self._anim("press", 1, 90)
         self._anim("ripple", 1, 560, start=0)
@@ -1184,6 +1225,7 @@ class Tile(QWidget):
     def mouseReleaseEvent(self, e):
         if e.button() != Qt.LeftButton:
             return
+        self._press_at = None
         self._anim("press", 0, 380, QEasingCurve.OutBack)
         if self.rect().contains(e.position().toPoint()):
             self.clicked.emit()
@@ -1199,6 +1241,8 @@ class Tile(QWidget):
         if not self.add and self.b is None:
             return      # 아직 보여줄 버튼이 없음 (버튼 0개일 때 편집 패널 미리보기). 그리다가 에러 나면 프로그램이 통째로 꺼짐
         p = QPainter(self)
+        if self.dragging:
+            p.setOpacity(0.3)          # 끌고 있는 버튼의 원래 자리
         p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
         r = QRectF(self.rect()).adjusted(10, 10, -10, -10)
         radius = 24
@@ -1759,8 +1803,24 @@ class MainWindow(QMainWindow):
     def eventFilter(self, obj, e):
         if obj is getattr(self, "topbar", None) and e.type() == QEvent.Resize:
             QTimer.singleShot(0, self._fit_topbar)
-        # 탐색기에서 프로그램·파일을 끌어다 놓기
         zone = getattr(self, "drop_zones", {}).get(obj)
+        # 버튼 끌어서 순서 바꾸기
+        if zone == "grid" and e.type() in (QEvent.DragEnter, QEvent.DragMove, QEvent.Drop, QEvent.DragLeave):
+            if e.type() == QEvent.DragLeave:
+                self.drop_mark.hide()
+                return False
+            if e.mimeData().hasFormat(TILE_MIME):
+                bid = bytes(e.mimeData().data(TILE_MIME)).decode()
+                idx = self._grid_index_at(obj, e.position().toPoint())
+                e.setDropAction(Qt.MoveAction)
+                e.accept()
+                if e.type() == QEvent.Drop:
+                    self.drop_mark.hide()
+                    self._reorder(bid, idx)
+                else:
+                    self._show_drop_mark(idx)
+                return True
+        # 탐색기에서 프로그램·파일을 끌어다 놓기
         if zone and e.type() in (QEvent.DragEnter, QEvent.DragMove, QEvent.Drop):
             paths = self._dropped_paths(e.mimeData())
             if not paths or (zone == "editor" and not self.selected):
@@ -1771,6 +1831,47 @@ class MainWindow(QMainWindow):
                 self._files_dropped(zone, paths)
             return True
         return super().eventFilter(obj, e)
+
+    def _grid_index_at(self, viewport, pos):
+        """끌고 있는 위치 → 몇 번째 자리에 넣을지 (버튼 위 왼쪽 절반이면 그 앞, 오른쪽 절반이면 그 뒤)"""
+        holder = self.grid_scroll.widget()
+        hp = holder.mapFrom(viewport, pos)
+        ids = [b["id"] for b in self.store.buttons]
+        for i, bid in enumerate(ids):
+            t = self.tiles.get(bid)
+            if t is None:
+                continue
+            g = t.geometry()
+            if g.top() <= hp.y() <= g.bottom() and hp.x() <= g.right():
+                if hp.x() < g.left():
+                    return i                  # 같은 줄, 이 버튼보다 왼쪽(사이 틈)
+                return i if hp.x() < g.center().x() else i + 1
+            if hp.y() < g.top():
+                return i                      # 이 줄보다 위 (줄 사이 틈)
+        return len(ids)
+
+    def _show_drop_mark(self, idx):
+        """넣을 자리에 민트색 세로 막대 표시"""
+        ids = [b["id"] for b in self.store.buttons]
+        if idx < len(ids) and ids[idx] in self.tiles:
+            g = self.tiles[ids[idx]].geometry()
+            x = g.left() + 4
+        elif ids and ids[-1] in self.tiles:
+            g = self.tiles[ids[-1]].geometry()
+            x = g.right() - 6
+        else:
+            return
+        self.drop_mark.setGeometry(x - 2, g.top() + 18, 5, g.height() - 36)
+        self.drop_mark.show()
+        self.drop_mark.raise_()
+
+    def _reorder(self, bid, idx):
+        old = [b["id"] for b in self.store.buttons]
+        self.store.move_to(bid, idx)
+        if [b["id"] for b in self.store.buttons] != old:
+            self.refresh_grid()
+            self.select(bid)
+            self.save_timer.start()           # 저장하고 연결된 기기에도 새 순서로 보냄
 
     def _drop_zone(self, widget, zone):
         if not hasattr(self, "drop_zones"):
@@ -1989,7 +2090,7 @@ class MainWindow(QMainWindow):
         head = QHBoxLayout()
         head.addWidget(QLabel(f"<span style='font-size:17px;font-weight:bold'>내 버튼</span>"))
         head.addStretch()
-        head.addWidget(QLabel("클릭해서 편집 · 기기에서 누르면 여기서도 반응해", objectName="hint"))
+        head.addWidget(QLabel("클릭해서 편집 · 끌어서 순서 바꾸기 · 파일을 끌어다 놓으면 새 버튼", objectName="hint"))
         lay.addLayout(head)
         holder = QWidget()
         self.grid = QGridLayout(holder)
@@ -2001,6 +2102,9 @@ class MainWindow(QMainWindow):
         self.grid_scroll.setWidget(holder)
         lay.addWidget(self.grid_scroll, 1)
         self._drop_zone(self.grid_scroll.viewport(), "grid")
+        self.drop_mark = QFrame(holder)
+        self.drop_mark.setStyleSheet(f"background:{MINT_D}; border-radius:2px;")
+        self.drop_mark.hide()
         self.columns = 4
         self.log_label = QLabel("아직 기록이 없어", objectName="log")
         self.log_label.setTextFormat(Qt.PlainText)    # 버튼 이름 등에 HTML이 섞여도 글자 그대로 표시
