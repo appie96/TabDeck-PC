@@ -28,3 +28,6 @@ python build_exe.py      # → dist\TabDeck.exe
 ## 사용한 것
 - 아이콘: [Lucide](https://lucide.dev) (ISC 라이선스)
 - 글꼴: [Pretendard](https://github.com/orioncactus/pretendard) (SIL Open Font License 1.1, `fonts/Pretendard-LICENSE.txt`)
+
+## 라이선스
+MIT 라이선스 (`LICENSE`). 아이콘과 글꼴은 위에 적은 각자의 라이선스를 따라.
