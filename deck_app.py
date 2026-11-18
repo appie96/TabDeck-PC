@@ -4,7 +4,7 @@ import asyncio, base64, hashlib, hmac, json, math, os, re, secrets, shutil, sock
 import urllib.error, urllib.request
 
 import websockets
-from PySide6.QtCore import Qt, QObject, Signal, QTimer, QSize, QPoint, QPointF, QRect, QRectF, QEvent, QByteArray, QBuffer, QIODevice, QVariantAnimation, QEasingCurve
+from PySide6.QtCore import Qt, QObject, QTranslator, Signal, QTimer, QSize, QPoint, QPointF, QRect, QRectF, QEvent, QByteArray, QBuffer, QIODevice, QVariantAnimation, QEasingCurve
 from PySide6.QtGui import (QIcon, QPixmap, QPainter, QPainterPath, QPen, QColor, QFont, QImage, QImageReader,
                            QKeySequence, QAction, QActionGroup, QFontDatabase, QGuiApplication, QLinearGradient, QRadialGradient)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QLabel, QLineEdit, QPushButton, QToolButton, QComboBox, QButtonGroup,
     QKeySequenceEdit, QStackedWidget, QGridLayout, QHBoxLayout, QVBoxLayout, QFrame, QFileDialog,
     QColorDialog, QMessageBox, QSystemTrayIcon, QMenu, QScrollArea, QDialog, QSlider, QLayout, QSizePolicy,
-    QListWidget, QDoubleSpinBox,
+    QListWidget, QDoubleSpinBox, QInputDialog,
 )
 
 # ───────────── 내장 아이콘 ─────────────
@@ -373,6 +373,26 @@ def open_target(target):
         subprocess.Popen(target, shell=True)        # 그 외에는 명령어로 실행
 
 
+class KoreanTexts(QTranslator):
+    """Qt 기본 위젯에 남은 영어 문구를 한국어로 (단축키 입력칸 안내 등)"""
+    TEXTS = {"Press shortcut": "여기를 누르고 단축키 입력"}
+
+    def translate(self, context, source, disambiguation=None, n=-1):
+        return self.TEXTS.get(source)          # 모르는 문구는 None → Qt가 원래 글자를 씀 ("" 를 돌려주면 글자가 사라짐)
+
+
+def group_item_name(item):
+    """그룹 항목을 사람이 읽기 좋게: 프로그램 이름 / 주소 / 단축키 / 기다리기"""
+    low = item.lower()
+    if low.startswith("key:"):
+        return "단축키 " + (QKeySequence(item[4:]).toString(QKeySequence.NativeText) or item[4:])
+    if low.startswith("wait:"):
+        return f"{item[5:]}초 기다리기"
+    if re.match(r"(?i)https?://", item):
+        return item
+    return os.path.basename(item.rstrip("\\/")) or item
+
+
 def run_action(b):
     t, cmd = b.get("type", "run"), b.get("cmd", "").strip()
     if t == "group":
@@ -380,14 +400,26 @@ def run_action(b):
         if not items:
             raise ValueError("그룹에 실행할 게 없어")
         gap = min(max(float(b.get("gap", 0.5) or 0), 0.0), 10.0)
-        fails = []
-        for i, item in enumerate(items):
-            if i and gap:
+        fails, prev_action = [], False
+        for item in items:
+            # 'wait:3' = 3초 기다리기 (이 자리에선 기본 간격 대신 이 시간만큼 쉼)
+            if item.lower().startswith("wait:"):
+                try:
+                    time.sleep(min(max(float(item[5:]), 0.0), 60.0))
+                except ValueError:
+                    fails.append(f"기다리기 시간 ({item[5:]})")
+                prev_action = False
+                continue
+            if prev_action and gap:
                 time.sleep(gap)                     # 프로그램끼리 부딪히지 않게 조금씩 간격
             try:
-                open_target(item)
+                if item.lower().startswith("key:"):
+                    send_hotkey(item[4:])          # 'key:ctrl+shift+f1' = 단축키 보내기
+                else:
+                    open_target(item)
             except Exception as e:
-                fails.append(f"{os.path.basename(item) or item} ({e})")
+                fails.append(f"{group_item_name(item)} ({e})")
+            prev_action = True
         if fails:
             raise ValueError(f"{len(items)}개 중 {len(fails)}개 실패: " + ", ".join(fails))
         return
@@ -2020,6 +2052,17 @@ class MainWindow(QMainWindow):
         g_browse.clicked.connect(self._group_browse)
         add_row.addWidget(g_browse)
         g2.addLayout(add_row)
+        extra_box = QWidget()
+        el = FlowLayout(extra_box, spacing=6)
+        g_key = QPushButton("+ 단축키")
+        g_key.setToolTip("그룹 중간에 단축키 보내기 (예: OBS 녹화 시작)")
+        g_key.clicked.connect(self._group_add_hotkey)
+        g_wait = QPushButton("+ 기다리기")
+        g_wait.setToolTip("다음 항목 전에 몇 초 기다리기 (예: 프로그램이 다 켜질 때까지)")
+        g_wait.clicked.connect(self._group_add_wait)
+        el.addWidget(g_key)
+        el.addWidget(g_wait)
+        g2.addWidget(extra_box)
         btn_box = QWidget()
         bl = FlowLayout(btn_box, spacing=6)
         self.group_up = QPushButton("↑ 위로", objectName="ghost")
@@ -2147,8 +2190,8 @@ class MainWindow(QMainWindow):
             "url": "예: https://www.youtube.com",
             "hotkey": "칸을 클릭하고 보낼 단축키를 그대로 눌러. OBS 단축키랑 맞추면 장면 전환에 쓸 수 있어. "
                       "받는 프로그램이 관리자 권한으로 켜져 있으면 TabDeck도 관리자 권한으로 켜야 해.",
-            "group": "버튼 하나로 위에서부터 차례로 열어. 프로그램·파일·바로가기와 https:// 주소를 섞어도 돼. "
-                     "한 번에 여러 개 고를 수도 있어.",
+            "group": "버튼 하나로 위에서부터 차례로 실행해. 프로그램·파일·주소에 단축키와 기다리기도 섞을 수 있어. "
+                     "예: OBS 켜기 → 5초 기다리기 → 녹화 단축키. 새 항목은 선택한 줄 바로 아래에 들어가.",
         }
         self.cmd_edit.setPlaceholderText("https://..." if t == "url" else "C:\\...\\program.exe")
         self.target_hint.setText(hints[t])
@@ -2262,9 +2305,59 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _group_label(item):
+        low = item.lower()
+        if low.startswith("key:"):
+            return "⌨  " + group_item_name(item)
+        if low.startswith("wait:"):
+            return "⏱  " + group_item_name(item)
         if re.match(r"(?i)https?://", item):
             return "🌐  " + item
-        return "▶  " + (os.path.basename(item.rstrip("\\/")) or item)
+        return "▶  " + group_item_name(item)
+
+    def _group_insert(self, item):
+        """선택한 항목 바로 아래에 넣음 (선택이 없으면 맨 끝)"""
+        items, row = self._group_items(), self.group_list.currentRow()
+        pos = row + 1 if 0 <= row < len(items) else len(items)
+        items.insert(pos, item)
+        self._group_save(items, pos)
+
+    def _group_add_hotkey(self):
+        dlg = QDialog(self)
+        dlg.setObjectName("root")
+        dlg.setWindowTitle("그룹에 단축키 넣기")
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(20, 18, 20, 16)
+        lay.addWidget(QLabel("칸을 클릭하고 보낼 단축키를 그대로 눌러", objectName="hint"))
+        edit = QKeySequenceEdit()
+        if hasattr(edit, "setMaximumSequenceLength"):
+            edit.setMaximumSequenceLength(1)
+        lay.addWidget(edit)
+        row = QHBoxLayout()
+        row.addStretch()
+        cancel = QPushButton("취소", objectName="ghost")
+        ok = QPushButton("넣기", objectName="primary")
+        cancel.clicked.connect(dlg.reject)
+        ok.clicked.connect(dlg.accept)
+        row.addWidget(cancel)
+        row.addWidget(ok)
+        lay.addLayout(row)
+        edit.setFocus()
+        if dlg.exec() != QDialog.Accepted:
+            return
+        text = edit.keySequence().toString(QKeySequence.PortableText).split(",")[0].strip().lower()
+        if not text:
+            return
+        try:
+            parse_hotkey(text, _win_vk_for_char if sys.platform == "win32" else None)
+        except ValueError as e:
+            QMessageBox.warning(self, "TabDeck", f"이 단축키는 보낼 수 없어: {e}")
+            return
+        self._group_insert("key:" + text)
+
+    def _group_add_wait(self):
+        sec, ok = QInputDialog.getDouble(self, "그룹에 기다리기 넣기", "몇 초 기다릴까? (최대 60초)", 3.0, 0.5, 60.0, 1)
+        if ok:
+            self._group_insert(f"wait:{sec:g}")
 
     def _group_items(self):
         return list(self.store.get(self.selected).get("group", [])) if self.selected else []
@@ -2457,6 +2550,8 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("TabDeck")
+    app._ko = KoreanTexts(app)              # 버려지지 않게 붙잡아 둠
+    app.installTranslator(app._ko)
     app.setWindowIcon(app_icon())
 
     # 이미 켜져 있으면 그 창을 앞으로 불러오고 끝냄 (두 번 실행하면 포트가 겹치니까)
